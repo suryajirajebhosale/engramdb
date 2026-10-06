@@ -20,7 +20,8 @@ classifiers = [
 
 [project.optional-dependencies]
 openai = ["openai>=1.40", "python-dotenv>=1.0"]
-dev = ["pytest>=8"]
+neo4j = ["neo4j>=5.14", "python-dotenv>=1.0"]
+dev = ["pytest>=8", "neo4j>=5.14"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/engramdb"]
@@ -28,3 +29,4 @@ packages = ["src/engramdb"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = ["neo4j: needs a running Neo4j (set ENGRAM_TEST_NEO4J_URI); skipped otherwise"]

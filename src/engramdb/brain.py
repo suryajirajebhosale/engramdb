@@ -154,6 +154,10 @@ class Brain:
                context: str | None = None, factors: RerankFactors = RerankFactors()) -> list[Ranked[T]]:
         return rerank(candidates, text_of, self.digest(user_id), context=context, factors=factors)
 
+    def forget(self, user_id: str) -> None:
+        """Erase everything stored about a user (GDPR-style right to be forgotten)."""
+        self.store.delete_user(user_id)
+
     # ── maintenance ────────────────────────────────────────────────────────
 
     def sweep(self, user_id: str) -> SweepReport:

@@ -45,6 +45,9 @@ class BrainStore(Protocol):
     def mark_processed(self, item_id: str) -> None: ...
     def is_processed(self, item_id: str) -> bool: ...
 
+    # erase everything stored for one user (right to be forgotten)
+    def delete_user(self, user_id: str) -> None: ...
+
 
 class InMemoryStore:
     """Dict-backed store with brute-force cosine kNN. Can save to / load from JSON."""
@@ -111,6 +114,16 @@ class InMemoryStore:
 
     def is_processed(self, item_id: str) -> bool:
         return item_id in self._processed
+
+    def delete_user(self, user_id: str) -> None:
+        nodes = [*self.traits(user_id, include_archived=True), *self.memories(user_id)]
+        doomed = {n.id for n in nodes} | {e for t in nodes if isinstance(t, Trait) for e in t.evidence}
+        for trait_id in [n.id for n in nodes if isinstance(n, Trait)]:
+            self._traits.pop(trait_id, None)
+        for memory_id in [n.id for n in nodes if isinstance(n, Memory)]:
+            self._memories.pop(memory_id, None)
+        self._edges = {e for e in self._edges if e.source not in doomed and e.target not in doomed}
+        self._processed -= doomed
 
     # persistence ────────────────────────────────────────────────────────────
 

@@ -1,5 +1,9 @@
 # engramdb
 
+[![CI](https://github.com/suryajirajebhosale/engramdb/actions/workflows/ci.yml/badge.svg)](https://github.com/suryajirajebhosale/engramdb/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
 **Long-term user memory for LLM apps, as a graph that learns, forgets and lights up.**
 
 Most "memory" for LLM apps is a vector store of past messages. That fails in
@@ -112,14 +116,63 @@ logic:
 
 | Interface | Default | Swap in |
 |---|---|---|
-| `BrainStore` | `InMemoryStore` (with JSON save/load) | Neo4j, Postgres + pgvector, Redis |
+| `BrainStore` | `InMemoryStore` (with JSON save/load) | **`Neo4jStore` (included)**; Postgres + pgvector or Redis by implementing the interface |
 | `Embedder` | `HashingEmbedder` (offline, lexical) | OpenAI, bge, sentence-transformers, Cohere |
 | `Judge` | `HeuristicJudge` | `LLMJudge(any_llm_json_fn)` |
 
 The core has **zero dependencies**. See [`examples/with_openai.py`](examples/with_openai.py)
 for real embeddings and an LLM judge.
 
-### Deployment shape
+## Neo4j storage
+
+`Neo4jStore` keeps each user's brain as a sub-graph in Neo4j, so traits, memories
+and their relations persist, are shared across workers and can be explored in the
+Neo4j Browser.
+
+```
+(:User {user_id})-[:HAS_TRAIT]->(:Trait:EngramNode {id, summary, context, polarity, strength, embedding, ...})
+(:User {user_id})-[:HAS_MEMORY]->(:Memory:EngramNode {id, text, event_date, embedding, ...})
+(:Trait)-[:SUPPORTS | CONTRADICTS | REFINES]->(:Trait)
+(:Memory)-[:DERIVED_FROM]->(:Trait)
+(:EngramProcessed {id})                      idempotency markers for queue consumers
+```
+
+```python
+from engramdb import Brain
+from engramdb.neo4j_store import Neo4jStore
+
+store = Neo4jStore.connect("bolt://localhost:7687", "neo4j", "password")
+store.setup(embedding_dim=1536)          # constraints + vector indexes; idempotent
+brain = Brain(store=store, embedder=my_embedder)
+```
+
+- **Per-user isolation.** Every query starts from the user's node, so one user's
+  brain is never visible from another's.
+- **Attach to your existing users.** `Neo4jStore(driver, user_label="Customer", user_key="customer_id")`
+  hangs the brain off `Customer` nodes your application already has.
+- **Similarity search, two modes:**
+  - `knn_mode="exact"` (default) scores only that user's nodes with
+    `vector.similarity.cosine`. Per-user graphs are small, so it's fast and exact,
+    and needs no vector index.
+  - `knn_mode="index"` uses Neo4j's native vector index. That index spans all users,
+    so results are over-fetched (`index_oversample`, default 20×) and then filtered to
+    the user. Use it when one user has many thousands of nodes.
+- **Same scores as in memory.** Neo4j reports cosine as `(1 + cos) / 2`. The store
+  converts it back to plain cosine, so thresholds behave the same on every backend.
+- **Right to be forgotten.** `brain.forget(user_id)` deletes the user's traits,
+  memories, relations and processed markers, and keeps the `User` node.
+- **Your own driver.** Pass your own `neo4j.Driver` to share connection pooling with
+  your app, plus `database=` for a non-default database.
+
+Requires **Neo4j 5.18+** (Community, Enterprise or Aura) for exact mode, or 5.13+ for
+index mode only. Try it with [`examples/with_neo4j.py`](examples/with_neo4j.py),
+which needs no LLM keys, then open <http://localhost:7474> and run
+`MATCH (u:User {user_id: 'demo-user'})-[*1..2]-(n) RETURN u, n`.
+
+The same 11-case contract test suite runs against `InMemoryStore` and against
+`Neo4jStore` in both modes. CI runs it against a real Neo4j service container.
+
+## Deployment shape
 
 The write path is slower (an embedding call plus an LLM call per observation) and
 belongs **off the request path**. Publish observations to a queue and run
@@ -141,8 +194,11 @@ chat turn ──► extractor ──► queue ──► worker: brain.observe() 
 | Python | everything | **3.10+** |
 | *(nothing else)* | the core library, `examples/quickstart.py`, tests | The core has **zero runtime dependencies**. |
 | `openai` | `examples/with_openai.py`, or your own OpenAI-backed embedder/judge | ≥ 1.40 (installed by the `openai` extra) |
-| `python-dotenv` | loading keys from a `.env` file (optional; plain env vars also work) | ≥ 1.0 (installed by the `openai` extra) |
-| `pytest` | running the test suite | ≥ 8 (installed by the `dev` extra) |
+| `python-dotenv` | loading keys from a `.env` file (optional; plain env vars also work) | ≥ 1.0 (installed by the `openai` and `neo4j` extras) |
+| `neo4j` (Python driver) | `Neo4jStore`, `examples/with_neo4j.py` | ≥ 5.14 (installed by the `neo4j` extra) |
+| Neo4j server | `Neo4jStore` | **5.18+**: Docker (`docker compose up -d neo4j`), Neo4j Desktop or [Aura](https://neo4j.com/cloud/aura/) |
+| Docker | optional, the easiest way to run Neo4j locally | any recent version |
+| `pytest` | running the test suite | ≥ 8 (installed by the `dev` extra, along with the `neo4j` driver) |
 
 ### 1. Install
 
@@ -155,16 +211,20 @@ source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -e .                     # core only: no keys, no dependencies
 pip install -e ".[dev]"              # + pytest
 pip install -e ".[openai]"           # + openai and python-dotenv for the real-LLM example
+pip install -e ".[neo4j]"            # + neo4j driver and python-dotenv for Neo4jStore
+pip install -e ".[openai,neo4j]"     # extras combine
 ```
 
 ### 2. Run without any keys
 
 ```bash
 python examples/quickstart.py        # offline demo: hashing embedder + heuristic judge
-pytest                               # 22 tests, no network
+pytest                               # 33 tests, no network (the Neo4j cases skip)
 ```
 
-### 3. Add API keys (only for real embeddings / LLM judge)
+### 3. Add API keys and connection settings
+
+Only needed for real embeddings and the LLM judge (OpenAI), and for Neo4j storage.
 
 The library never reads keys itself. You pass an `Embedder` and a `complete_json`
 function into `Brain`, and they bring their own credentials. The bundled OpenAI
@@ -182,6 +242,11 @@ Then edit `.env`:
 | `OPENAI_BASE_URL` | no | Send requests to any OpenAI-compatible server instead (Azure OpenAI, vLLM, Ollama `http://localhost:11434/v1`, LiteLLM, OpenRouter) | Your provider's docs |
 | `ENGRAM_LLM_MODEL` | no | Model the `LLMJudge` uses. Default `gpt-4o-mini`. It must support JSON mode. | |
 | `ENGRAM_EMBEDDING_MODEL` | no | Embedding model. Default `text-embedding-3-small`. | |
+| `NEO4J_URI` | **yes** (for Neo4j) | Bolt URI, e.g. `bolt://localhost:7687`; Aura uses `neo4j+s://<id>.databases.neo4j.io` | `docker compose` default, or Aura's credentials file |
+| `NEO4J_USER` | **yes** (for Neo4j) | Usually `neo4j` | same |
+| `NEO4J_PASSWORD` | **yes** (for Neo4j) | The `docker-compose.yml` default is `engramdb-dev` | Set it yourself, or use the one Aura generates |
+| `NEO4J_DATABASE` | no | Non-default database name (Enterprise / Aura) | |
+| `ENGRAM_TEST_NEO4J_URI` / `_USER` / `_PASSWORD` | no | Enables the Neo4j cases in `pytest`. **The tests wipe engramdb and `User` nodes, so use a throwaway database.** | |
 
 Instead of a `.env` file you can export the variables in your shell:
 
@@ -189,6 +254,25 @@ Instead of a `.env` file you can export the variables in your shell:
 export OPENAI_API_KEY=sk-...
 python examples/with_openai.py
 ```
+
+The library itself never reads `NEO4J_*` variables either. They're only read by
+the examples, which pass them to `Neo4jStore.connect(...)`. In your app, pass
+credentials however you manage secrets.
+
+To run Neo4j locally and run the full test suite against it:
+
+```bash
+docker compose up -d neo4j           # browser at http://localhost:7474
+export ENGRAM_TEST_NEO4J_URI=bolt://localhost:7687
+export ENGRAM_TEST_NEO4J_PASSWORD=engramdb-dev
+pytest                               # 55 tests, including 22 against Neo4j
+python examples/with_neo4j.py        # reads NEO4J_* from .env
+```
+
+> **Neo4j password gotcha:** `docker compose` reads `NEO4J_PASSWORD` from your
+> `.env` (default `engramdb-dev`), but Neo4j only applies it the **first** time the
+> data volume is created. To change it later, reset the volume with
+> `docker compose down -v`. This deletes the local graph.
 
 ### 4. Using another provider
 
